@@ -51,7 +51,7 @@ FILE_TYPE_MAP = {
 # 文件搜索器
 # -------------------
 class DiskIndexer:
-    def __init__(self, index_file="disk_index.pkl"):
+    def __init__(self, index_file="search_index.pkl"):
         self.index_file = index_file
         self.index = defaultdict(list)
 
@@ -131,6 +131,38 @@ class DiskIndexer:
         with open(self.index_file, "rb") as f:
             self.index = pickle.load(f)
         print(f"[✓] 索引文件 {self.index_file} 加载完成")
+
+    def rebuild_index(self, drives=None):
+        """
+        强制重建索引（覆盖更新）
+        - 清空内存索引
+        - 删除旧索引文件
+        - 重新全盘扫描
+        """
+        print("[!] 强制重建索引中...")
+
+        # 1. 清空内存索引
+        self.index = defaultdict(list)
+
+        # 2. 删除旧索引文件（如果存在）
+        if os.path.exists(self.index_file):
+            os.remove(self.index_file)
+            print(f"[✓] 已删除旧索引文件: {self.index_file}")
+
+        # 3. 重新构建索引
+        if drives is None:
+            drives = get_available_drives()
+
+        print(f"[+] 开始全盘重建索引: {', '.join(drives)}")
+        start = time.time()
+        for d in drives:
+            self._scan_dir(d)
+
+        print(f"[✓] 索引重建完成，耗时 {time.time() - start:.2f}s")
+        print(f"[✓] 文件总数: {sum(len(v) for v in self.index.values())}")
+
+        # 4. 覆盖保存
+        self.save_index()
 
 
 if __name__ == "__main__":

@@ -20,16 +20,15 @@ def relaunch_as_admin():
 
 def get_available_drives() -> List[str]:
     """
-    获取磁盘信息
-    :param self:
-    :return:
+    获取系统可用磁盘盘符
+    返回格式: ["C:\\", "D:\\", "E:\\"]
     """
     drives = []
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-    for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-        if bitmask & 1:
-            # 过滤掉 A 和 B 盘（通常是软驱）
-            if letter not in 'AB':
-                drives.append(letter)
-        bitmask >>= 1
+
+    for i, letter in enumerate('ABCDEFGHIJKLMNOPQRSTUVWXYZ'):
+        if bitmask & (1 << i):
+            if letter not in ('A', 'B'):
+                drives.append(f"{letter}:\\")
+
     return drives

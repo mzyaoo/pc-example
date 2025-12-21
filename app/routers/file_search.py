@@ -17,3 +17,13 @@ def search(query: str, search_type: str = None):
     """
     results = indexer.search(query, search_type)
     return results
+
+
+@router.get("/v1/reload/index")
+def reload_index():
+    """
+    文件搜索接口
+    - q: 关键字
+    返回: [{"name": 文件名, "size": 文件大小, "path": 文件完整路径}, ...]
+    """
+    indexer.rebuild_index()
