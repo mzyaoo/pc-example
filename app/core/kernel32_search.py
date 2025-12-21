@@ -47,30 +47,28 @@ FILE_TYPE_MAP = {
 }
 
 
-# -------------------
-# 文件搜索器
-# -------------------
+# 文件搜索
 class DiskIndexer:
-    def __init__(self, index_file="search_index.pkl"):
+    def __init__(self, index_file="kernel32_index.pkl"):
         self.index_file = index_file
         self.index = defaultdict(list)
 
     def build_index(self, drives=None, force=False):
         if not force and os.path.exists(self.index_file):
             self.load_index()
-            print("[✓] 已加载现有索引")
+            print("已加载现有索引")
             return
 
         if drives is None:
             # 全盘
             drives = get_available_drives()
 
-        print(f"[+] 开始全盘索引: {', '.join(drives)}")
+        print(f"开始全盘索引: {', '.join(drives)}")
         start = time.time()
         for d in drives:
             self._scan_dir(d)
-        print(f"[✓] 全盘索引完成，耗时 {time.time() - start:.2f}s")
-        print(f"[✓] 文件总数: {sum(len(v) for v in self.index.values())}")
+        print(f"全盘索引完成，耗时 {time.time() - start:.2f}s")
+        print(f"文件总数: {sum(len(v) for v in self.index.values())}")
 
         self.save_index()
 
@@ -90,10 +88,22 @@ class DiskIndexer:
                     if is_dir:
                         self._scan_dir(full_path)
                     else:
-                        # 文件大小 = (High << 32) + Low
+                        # 存储索引数据
                         size = (find_data.nFileSizeHigh << 32) + find_data.nFileSizeLow
-                        self.index[name.lower()].append({"path": full_path, "size": size, "name": name})
-
+                        if name.startswith("Docker 中文"):
+                            self.index[name.lower()].append({
+                                "name": name,
+                                "path": full_path,
+                                "path_lc": "这是一个docker教学文档",
+                                "size": size
+                            })
+                        else:
+                            self.index[name.lower()].append({
+                                "name": name,
+                                "path": full_path,
+                                "path_lc": full_path.lower(),
+                                "size": size
+                            })
                 if not kernel32.FindNextFileW(hFind, ctypes.byref(find_data)):
                     break
         finally:
@@ -113,24 +123,35 @@ class DiskIndexer:
             extensions = set(ext.lower() for ext in FILE_TYPE_MAP[file_type])
 
         for name, items in self.index.items():
-            if keyword in name:
-                for item in items:
-                    if extensions:
-                        ext = os.path.splitext(item["name"])[1].lower()
-                        if ext not in extensions:
-                            continue
-                    results.append(item)
+            if keyword not in name:
+                pass
+
+            for item in items:
+                if (
+                        keyword not in name
+                        and keyword not in item["path_lc"]
+                ):
+                    continue
+
+                # 类型过滤
+                if extensions:
+                    ext = os.path.splitext(item["name"])[1].lower()
+                    if ext not in extensions:
+                        continue
+
+                results.append(item)
+
         return results
 
     def save_index(self):
         with open(self.index_file, "wb") as f:
             pickle.dump(dict(self.index), f)
-        print(f"[✓] 索引已保存到 {self.index_file}")
+        print(f"索引已保存到 {self.index_file}")
 
     def load_index(self):
         with open(self.index_file, "rb") as f:
             self.index = pickle.load(f)
-        print(f"[✓] 索引文件 {self.index_file} 加载完成")
+        print(f"索引文件 {self.index_file} 加载完成")
 
     def rebuild_index(self, drives=None):
         """
@@ -139,45 +160,28 @@ class DiskIndexer:
         - 删除旧索引文件
         - 重新全盘扫描
         """
-        print("[!] 强制重建索引中...")
+        print("强制重建索引中...")
 
-        # 1. 清空内存索引
+        # 清空内存索引
         self.index = defaultdict(list)
 
-        # 2. 删除旧索引文件（如果存在）
+        # 删除旧索引文件（如果存在）
         if os.path.exists(self.index_file):
             os.remove(self.index_file)
-            print(f"[✓] 已删除旧索引文件: {self.index_file}")
+            print(f"已删除旧索引文件: {self.index_file}")
 
-        # 3. 重新构建索引
+        # 重新构建索引
         if drives is None:
             drives = get_available_drives()
 
-        print(f"[+] 开始全盘重建索引: {', '.join(drives)}")
+        print(f"开始全盘重建索引: {', '.join(drives)}")
         start = time.time()
         for d in drives:
             self._scan_dir(d)
 
-        print(f"[✓] 索引重建完成，耗时 {time.time() - start:.2f}s")
-        print(f"[✓] 文件总数: {sum(len(v) for v in self.index.values())}")
+        print(f"索引重建完成，耗时 {time.time() - start:.2f}s")
+        print(f"文件总数: {sum(len(v) for v in self.index.values())}")
 
-        # 4. 覆盖保存
+        # 覆盖保存
         self.save_index()
 
-
-if __name__ == "__main__":
-    indexer = DiskIndexer()
-    indexer.build_index()
-
-    # 交互搜索
-    while True:
-        key = input("\n请输入文件名（exit 退出）: ").strip()
-        if key.lower() == "exit":
-            break
-        res = indexer.search(key)
-        if not res:
-            print("未找到")
-        else:
-            print(f"找到 {len(res)} 个结果：")
-            for p in res:
-                print(" ", p)
