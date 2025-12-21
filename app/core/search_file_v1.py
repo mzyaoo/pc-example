@@ -2,9 +2,23 @@ import os
 import time
 import sys
 import ctypes
-from typing import List
+from typing import List, Optional, Dict, Any
 
-from app.core.windows_utils import is_admin, relaunch_as_admin
+
+# --- 辅助函数：检查管理员权限 ---
+def is_admin() -> bool:
+    """检查当前脚本是否以管理员权限运行。"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except:
+        return False
+
+
+def relaunch_as_admin():
+    """触发 UAC 提升权限重新运行脚本。"""
+    ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", sys.executable, " ".join(sys.argv), None, 1
+    )
 
 
 # --- 核心类：文件搜索器 ---

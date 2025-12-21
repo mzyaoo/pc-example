@@ -1,5 +1,6 @@
 from fastapi import FastAPI
-from app.routers import health
+from app.routers import health as health_router
+from app.routers import file_search as file_search_router
 
 import uvicorn
 
@@ -12,7 +13,8 @@ def create_app() -> FastAPI:
     )
 
     # 注册路由
-    app.include_router(health.router, prefix="/health", tags=["Health"])
+    app.include_router(health_router.router, prefix="/health", tags=["Health"])
+    app.include_router(file_search_router.router, prefix="/file", tags=["FileSearch"])
 
     return app
 
