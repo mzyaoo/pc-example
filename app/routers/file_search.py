@@ -1,15 +1,19 @@
 from fastapi import APIRouter
 
+from app.core.kernel32_search import DiskIndexer
+
 router = APIRouter()
 
+indexer = DiskIndexer()
+indexer.build_index()
 
-@router.get("/v1/search/{query}")
-def search(query: str, search_type: str):
-    # results, count, duration = searcher.search(search_query, file_type=filter_type)
-    #
-    # print(f"\n--- 找到 {count} 个结果 (耗时: {duration:.4f}s) ---")
-    # if count > 0:
-    #     print(results)
-    # else:
-    #     print("未找到匹配项。")
-    return {}
+
+@router.get("/v1/search")
+def search(query: str, search_type: str = None):
+    """
+    文件搜索接口
+    - q: 关键字
+    返回: [{"name": 文件名, "size": 文件大小, "path": 文件完整路径}, ...]
+    """
+    results = indexer.search(query, search_type)
+    return results
