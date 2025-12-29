@@ -2,14 +2,20 @@ import ctypes
 import os
 import time
 import pickle
+import gzip
+import sys
 
 from ctypes import wintypes
-from collections import defaultdict
+from typing import Dict, List, Optional, Any, Iterable, Tuple
+
 from app.core.windows_utils import get_available_drives, filetime_to_str, format_size
 from app.vo.file_search import SearchRequest
 
-# kernel32 设置
+# =========================
+# Win32 API
+# =========================
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 FILE_ATTRIBUTE_DIRECTORY = 0x10
 
@@ -28,6 +34,7 @@ class WIN32_FIND_DATAW(ctypes.Structure):
         ("cAlternateFileName", wintypes.WCHAR * 14),
     ]
 
+
 kernel32.FindFirstFileW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(WIN32_FIND_DATAW)]
 kernel32.FindFirstFileW.restype = wintypes.HANDLE
 kernel32.FindNextFileW.argtypes = [wintypes.HANDLE, ctypes.POINTER(WIN32_FIND_DATAW)]
@@ -35,155 +42,331 @@ kernel32.FindNextFileW.restype = wintypes.BOOL
 kernel32.FindClose.argtypes = [wintypes.HANDLE]
 kernel32.FindClose.restype = wintypes.BOOL
 
+# =========================
+# 文件类型映射
+# =========================
 FILE_TYPE_MAP = {
     "图片": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".ico", ".svg"],
-    "文档": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf", ".odt", ".ods", ".odp"],
-    "视频": [".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".3gp"],
-    "音频": [".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a"],
-    "压缩包": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"],
-    "代码": [".py", ".js", ".html", ".css", ".cpp", ".c", ".java", ".cs", ".php", ".vb", ".xml", ".json", ".yaml",
-             ".yml"],
-    "可执行文件": [".exe", ".msi", ".bat", ".cmd", ".ps1"]
+    "文档": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt"],
+    "视频": [".mp4", ".avi", ".mkv", ".mov", ".wmv"],
+    "音频": [".mp3", ".wav", ".flac", ".aac"],
+    "压缩包": [".zip", ".rar", ".7z"],
+    "代码": [".py", ".js", ".html", ".css", ".json", ".xml"],
+    "可执行文件": [".exe", ".msi", ".bat"],
 }
 
 
-# 文件搜索
+# =========================
+# DiskIndexer（工程版）
+# =========================
 class DiskIndexer:
-    def __init__(self, index_file="kernel32_index.pkl"):
-        self.index_file = index_file
-        self.index = defaultdict(list)
+    INDEX_VERSION = 1
 
-    def build_index(self, drives=None, force=False):
-        if not force and os.path.exists(self.index_file):
-            self.load_index()
-            print("已加载现有索引")
+    DEFAULT_SKIP_DIRS_BY_DRIVE = {
+        "C:": {
+            "windows",
+            "program files",
+            "program files (x86)",
+            "programdata",
+            "$recycle.bin",
+            "system volume information",
+        }
+    }
+
+    def __init__(
+            self,
+            index_file: str = "kernel32_index.pkl.gz",
+            skip_dirs: Optional[Iterable[str]] = None,
+            auto_build: bool = True,
+    ):
+        self.index_file = index_file
+        self.skip_dirs = set(d.lower() for d in (skip_dirs or self.DEFAULT_SKIP_DIRS_BY_DRIVE.get("C:")))
+
+        self.files: List[Dict[str, Any]] = []
+        self.file_map: Dict[str, Dict[str, Any]] = {}
+        self.meta: Dict[str, Any] = {}
+        self.ready: bool = False
+        self._init_index(auto_build)
+
+    def _init_index(self, auto_build: bool):
+        if os.path.exists(self.index_file):
+            if self._try_load_index():
+                self.ready = True
+                return
+            else:
+                print("索引损坏或不兼容，准备重建…")
+                try:
+                    os.remove(self.index_file)
+                except OSError:
+                    pass
+
+        if auto_build:
+            print("索引不存在，首次启动自动建立索引…")
+            self.build_index(force=True)
+            self.ready = True
+        else:
+            self.ready = False
+
+    def build_index(self, drives: Optional[List[str]] = None, force: bool = False):
+        if not force and self._try_load_index():
+            print("已加载现有索引（无需重建）")
             return
 
         if drives is None:
-            # 全盘
             drives = get_available_drives()
 
-        print(f"开始全盘索引: {', '.join(drives)}")
+        print(f"开始建立索引: {', '.join(drives)}")
         start = time.time()
+
+        self.files.clear()
+        self.file_map.clear()
+
         for d in drives:
-            self._scan_dir(d)
-        print(f"全盘索引完成，耗时 {time.time() - start:.2f}s")
-        print(f"文件总数: {sum(len(v) for v in self.index.values())}")
+            self._scan_drive_full(d)
 
-        self.save_index()
+        self._build_meta(drives)
+        self._save_index()
 
-    def _scan_dir(self, path):
-        search_path = os.path.join(path, "*")
-        find_data = WIN32_FIND_DATAW()
-        hFind = kernel32.FindFirstFileW(search_path, ctypes.byref(find_data))
-        if hFind == INVALID_HANDLE_VALUE:
+        print(f"索引完成，耗时 {time.time() - start:.2f}s，文件数 {len(self.files)}")
+
+    def update_index(self, drives: Optional[List[str]] = None):
+        """增量更新索引（推荐日常使用）"""
+        if not self._try_load_index():
+            self.build_index(drives=drives, force=True)
             return
 
-        try:
-            while True:
-                name = find_data.cFileName
-                if name not in (".", ".."):
-                    full_path = os.path.join(path, name)
-                    is_dir = find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY
-                    if is_dir:
-                        self._scan_dir(full_path)
-                    else:
-                        # 原始字节数
-                        size_bytes = (find_data.nFileSizeHigh << 32) + find_data.nFileSizeLow
+        if drives is None:
+            drives = self.meta.get("drives") or get_available_drives()
 
-                        # 展示的文件大小
-                        size_str = format_size(size_bytes)
+        print("开始增量更新索引...")
+        start = time.time()
 
-                        last_write_time = filetime_to_str(find_data.ftLastWriteTime)
-                        self.index[name.lower()].append({
-                            "Name": name,
-                            "Path": full_path,
-                            "Size": size_str,
-                            "RawSize": size_bytes,
-                            "UpdateTime": last_write_time,
-                            "Described": "",
-                            "FileID": "",
-                        })
-                if not kernel32.FindNextFileW(hFind, ctypes.byref(find_data)):
-                    break
-        finally:
-            kernel32.FindClose(hFind)
+        for d in drives:
+            self._scan_drive_incremental(d)
 
+        self.meta["updated_at"] = time.time()
+        self.meta["total_files"] = len(self.files)
+
+        self._save_index()
+
+        print(f"增量更新完成，耗时 {time.time() - start:.2f}s")
+
+    def rebuild_index(self, drives: Optional[List[str]] = None):
+        print("强制重建索引...")
+        if os.path.exists(self.index_file):
+            os.remove(self.index_file)
+        self.build_index(drives=drives, force=True)
+
+    # =========================
+    # 扫描逻辑
+    # =========================
+    def _scan_drive_full(self, root: str):
+        stack = [root]
+
+        while stack:
+            path = stack.pop()
+            search_path = os.path.join(path, "*")
+
+            fd = WIN32_FIND_DATAW()
+            h = kernel32.FindFirstFileW(search_path, ctypes.byref(fd))
+            if h == INVALID_HANDLE_VALUE:
+                continue
+
+            try:
+                while True:
+                    name = fd.cFileName
+                    if name not in (".", ".."):
+                        full = os.path.join(path, name)
+                        is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY
+
+                        if is_dir:
+                            if name.lower() not in self.skip_dirs:
+                                stack.append(full)
+                        else:
+                            item = self._build_file_item(fd, name, full)
+                            self.files.append(item)
+                            self.file_map[full] = item
+
+                    if not kernel32.FindNextFileW(h, ctypes.byref(fd)):
+                        break
+            finally:
+                kernel32.FindClose(h)
+
+    def _scan_drive_incremental(self, root: str):
+        stack = [root]
+        seen_paths = set()
+
+        while stack:
+            path = stack.pop()
+            search_path = os.path.join(path, "*")
+
+            fd = WIN32_FIND_DATAW()
+            h = kernel32.FindFirstFileW(search_path, ctypes.byref(fd))
+            if h == INVALID_HANDLE_VALUE:
+                continue
+
+            try:
+                while True:
+                    name = fd.cFileName
+                    if name not in (".", ".."):
+                        full = os.path.join(path, name)
+                        is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY
+
+                        if is_dir:
+                            if name.lower() not in self.skip_dirs:
+                                stack.append(full)
+                        else:
+                            seen_paths.add(full)
+                            fp = self._fingerprint(fd)
+
+                            old = self.file_map.get(full)
+                            if not old:
+                                item = self._build_file_item(fd, name, full)
+                                self.files.append(item)
+                                self.file_map[full] = item
+                            elif old["FP"] != fp:
+                                self._update_file_item(old, fd)
+
+                    if not kernel32.FindNextFileW(h, ctypes.byref(fd)):
+                        break
+            finally:
+                kernel32.FindClose(h)
+
+        # 删除不存在的文件
+        to_remove = [
+            p for p in self.file_map
+            if p.startswith(root) and p not in seen_paths
+        ]
+
+        for p in to_remove:
+            item = self.file_map.pop(p)
+            self.files.remove(item)
+
+    # =========================
+    # 文件构建 / 更新
+    # =========================
+    def _build_file_item(self, fd, name, full_path) -> Dict[str, Any]:
+        size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
+        ext = os.path.splitext(name)[1].lower()
+
+        return {
+            "Name": name,
+            "NameLC": name.lower(),
+            "Ext": ext,
+            "Path": full_path,
+            "RawSize": size,
+            "UpdateTime": filetime_to_str(fd.ftLastWriteTime),
+            "FP": self._fingerprint(fd),
+        }
+
+    def _update_file_item(self, item: Dict[str, Any], fd):
+        size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
+        item["RawSize"] = size
+        item["UpdateTime"] = filetime_to_str(fd.ftLastWriteTime)
+        item["FP"] = self._fingerprint(fd)
+
+    @staticmethod
+    def _fingerprint(fd) -> Tuple[int, int, int, int]:
+        return (
+            fd.nFileSizeHigh,
+            fd.nFileSizeLow,
+            fd.ftLastWriteTime.dwLowDateTime,
+            fd.ftLastWriteTime.dwHighDateTime,
+        )
+
+    # =========================
+    # 搜索
+    # =========================
     def search(self, query: SearchRequest):
-        """
-        搜索文件
-        - keyword: 文件名关键字
-        - fil e_type: 文件类型
-        """
-        keyword = query.keyword.lower()
-        file_type = query.file_type
-        # start_time = query.start_time
-        # end_time = query.end_time
+        keyword = (query.keyword or "").strip().lower()
+        if not keyword:
+            return []
+
+        exts = None
+        if query.file_type in FILE_TYPE_MAP:
+            exts = set(FILE_TYPE_MAP[query.file_type])
+
         results = []
+        append = results.append
 
-        extensions = None
-        if file_type and file_type in FILE_TYPE_MAP:
-            extensions = set(ext.lower() for ext in FILE_TYPE_MAP[file_type])
-
-        for name, items in self.index.items():
-            if keyword not in name:
-                pass
-
-            for item in items:
-                if (
-                        keyword not in name
-                        # and keyword not in item["path_lc"]
-                ):
-                    continue
-
-                # 类型过滤
-                if extensions:
-                    ext = os.path.splitext(item["Name"])[1].lower()
-                    if ext not in extensions:
-                        continue
-
-                results.append(item)
+        for f in self.files:
+            if keyword not in f["NameLC"]:
+                continue
+            if exts and f["Ext"] not in exts:
+                continue
+            append(f)
 
         return results
 
-    def save_index(self):
-        with open(self.index_file, "wb") as f:
-            pickle.dump(dict(self.index), f)
-        print(f"索引已保存到 {self.index_file}")
+    # =========================
+    # 索引存储
+    # =========================
+    def _build_meta(self, drives):
+        self.meta = {
+            "version": self.INDEX_VERSION,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "python": sys.version,
+            "drives": drives,
+            "skip_dirs": sorted(self.skip_dirs),
+            "total_files": len(self.files),
+        }
 
-    def load_index(self):
-        with open(self.index_file, "rb") as f:
-            self.index = pickle.load(f)
-        print(f"索引文件 {self.index_file} 加载完成")
+    def _save_index(self):
+        data = {
+            "meta": self.meta,
+            "files": self.files,
+        }
+        with gzip.open(self.index_file, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"索引已保存: {self.index_file}")
 
-    def rebuild_index(self, drives=None):
-        """
-        强制重建索引（覆盖更新）
-        - 清空内存索引
-        - 删除旧索引文件
-        - 重新全盘扫描
-        """
-        print("强制重建索引中...")
+    def _try_load_index(self) -> bool:
+        if not os.path.exists(self.index_file):
+            return False
 
-        # 清空内存索引
-        self.index = defaultdict(list)
+        try:
+            with gzip.open(self.index_file, "rb") as f:
+                data = pickle.load(f)
+        except Exception:
+            return False
 
-        # 删除旧索引文件（如果存在）
-        if os.path.exists(self.index_file):
-            os.remove(self.index_file)
-            print(f"已删除旧索引文件: {self.index_file}")
+        meta = data.get("meta")
+        if not meta or meta.get("version") != self.INDEX_VERSION:
+            return False
 
-        # 重新构建索引
-        if drives is None:
-            drives = get_available_drives()
+        if set(meta.get("skip_dirs", [])) != self.skip_dirs:
+            return False
 
-        print(f"开始全盘重建索引: {', '.join(drives)}")
-        start = time.time()
-        for d in drives:
-            self._scan_dir(d)
+        self.meta = meta
+        self.files = data.get("files", [])
+        self.file_map = {f["Path"]: f for f in self.files}
 
-        print(f"索引重建完成，耗时 {time.time() - start:.2f}s")
-        print(f"文件总数: {sum(len(v) for v in self.index.values())}")
+        return True
 
-        # 覆盖保存
-        self.save_index()
+    # =========================
+    # UI 显示辅助
+    # =========================
+    @staticmethod
+    def enrich_for_display(item: Dict[str, Any]) -> Dict[str, Any]:
+        new_item = dict(item)
+        new_item["Size"] = format_size(item.get("RawSize", 0))
+        return new_item
+
+
+if __name__ == '__main__':
+    indexer = DiskIndexer()
+
+    # 第一次
+    # indexer.build_index()
+
+    # 以后启动
+    # indexer.update_index()
+
+    # 搜索
+    searchQuery = SearchRequest()
+    searchQuery.keyword = 'docker'
+    searchQuery.file_type = '文档'
+    results = indexer.search(searchQuery)
+    for result in results:
+        print(result)

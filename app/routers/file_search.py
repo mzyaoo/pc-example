@@ -6,8 +6,6 @@ from app.vo.file_search import SearchRequest
 router = APIRouter()
 
 indexer = DiskIndexer()
-indexer.build_index()
-
 
 @router.get("/v1/search")
 def search(query: str, file_type: str = None):
@@ -30,4 +28,4 @@ def reload_index():
     - q: 关键字
     返回: [{"name": 文件名, "size": 文件大小, "path": 文件完整路径}, ...]
     """
-    indexer.rebuild_index()
+    indexer.update_index()
