@@ -5,7 +5,8 @@ import pickle
 
 from ctypes import wintypes
 from collections import defaultdict
-from app.core.windows_utils import get_available_drives
+from app.core.windows_utils import get_available_drives, filetime_to_str, format_size
+from app.vo.file_search import SearchRequest
 
 # kernel32 设置
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -26,7 +27,6 @@ class WIN32_FIND_DATAW(ctypes.Structure):
         ("cFileName", wintypes.WCHAR * 260),
         ("cAlternateFileName", wintypes.WCHAR * 14),
     ]
-
 
 kernel32.FindFirstFileW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(WIN32_FIND_DATAW)]
 kernel32.FindFirstFileW.restype = wintypes.HANDLE
@@ -88,34 +88,37 @@ class DiskIndexer:
                     if is_dir:
                         self._scan_dir(full_path)
                     else:
-                        # 存储索引数据
-                        size = (find_data.nFileSizeHigh << 32) + find_data.nFileSizeLow
-                        if name.startswith("Docker 中文"):
-                            self.index[name.lower()].append({
-                                "name": name,
-                                "path": full_path,
-                                "path_lc": "这是一个docker教学文档",
-                                "size": size
-                            })
-                        else:
-                            self.index[name.lower()].append({
-                                "name": name,
-                                "path": full_path,
-                                "path_lc": full_path.lower(),
-                                "size": size
-                            })
+                        # 原始字节数
+                        size_bytes = (find_data.nFileSizeHigh << 32) + find_data.nFileSizeLow
+
+                        # 展示的文件大小
+                        size_str = format_size(size_bytes)
+
+                        last_write_time = filetime_to_str(find_data.ftLastWriteTime)
+                        self.index[name.lower()].append({
+                            "Name": name,
+                            "Path": full_path,
+                            "Size": size_str,
+                            "RawSize": size_bytes,
+                            "UpdateTime": last_write_time,
+                            "Described": "",
+                            "FileID": "",
+                        })
                 if not kernel32.FindNextFileW(hFind, ctypes.byref(find_data)):
                     break
         finally:
             kernel32.FindClose(hFind)
 
-    def search(self, keyword, file_type=None):
+    def search(self, query: SearchRequest):
         """
         搜索文件
         - keyword: 文件名关键字
-        - file_type: FILE_TYPE_MAP 中的大类，如 "图片"、"文档"
+        - fil e_type: 文件类型
         """
-        keyword = keyword.lower()
+        keyword = query.keyword.lower()
+        file_type = query.file_type
+        # start_time = query.start_time
+        # end_time = query.end_time
         results = []
 
         extensions = None
@@ -129,13 +132,13 @@ class DiskIndexer:
             for item in items:
                 if (
                         keyword not in name
-                        and keyword not in item["path_lc"]
+                        # and keyword not in item["path_lc"]
                 ):
                     continue
 
                 # 类型过滤
                 if extensions:
-                    ext = os.path.splitext(item["name"])[1].lower()
+                    ext = os.path.splitext(item["Name"])[1].lower()
                     if ext not in extensions:
                         continue
 
@@ -184,4 +187,3 @@ class DiskIndexer:
 
         # 覆盖保存
         self.save_index()
-

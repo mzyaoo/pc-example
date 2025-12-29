@@ -190,9 +190,6 @@ class FileSearcher:
             if res == 1:
                 print(f"驱动器 {drive} 索引已保存至: {path}")
 
-
-# --- 交互界面 ---
-
 def main():
     try:
         searcher = FileSearcher()
