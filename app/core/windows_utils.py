@@ -39,14 +39,8 @@ def filetime_to_str(ft):
     """
     将 Windows FILETIME 结构转换为可读字符串 (YYYY-MM-DD HH:MM:SS)
     """
-    # 组合高位和低位得到 64 位整数
     quad = (ft.dwHighDateTime << 32) | ft.dwLowDateTime
 
-    # Windows FILETIME 是自 1601-01-01 起的 100纳秒间隔
-    # Unix 时间戳是自 1970-01-01 起的秒数
-    # 两者相差 116444736000000000 个 100纳秒单位
-
-    # 如果文件时间为0（无效），直接返回空
     if quad == 0:
         return ""
 

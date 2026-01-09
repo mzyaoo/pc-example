@@ -21,7 +21,6 @@ def create_app() -> FastAPI:
 
 app = create_app()
 
-
 def main():
     """
     main 方法启动项目

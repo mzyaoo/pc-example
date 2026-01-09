@@ -6,10 +6,9 @@ import gzip
 import sys
 
 from ctypes import wintypes
-from typing import Dict, List, Optional, Any, Iterable, Tuple
+from typing import Dict, List, Optional, Any, Iterable, Tuple, Set
 
 from app.core.windows_utils import get_available_drives, filetime_to_str, format_size
-from app.vo.file_search import SearchRequest
 
 # =========================
 # Win32 API
@@ -62,14 +61,17 @@ FILE_TYPE_MAP = {
 class DiskIndexer:
     INDEX_VERSION = 1
 
-    DEFAULT_SKIP_DIRS_BY_DRIVE = {
+    COMMON_SKIP_DIRS = {
+        "$recycle.bin",
+        "system volume information",
+    }
+
+    SKIP_DIRS_BY_DRIVE = {
         "C:": {
             "windows",
             "program files",
             "program files (x86)",
             "programdata",
-            "$recycle.bin",
-            "system volume information",
         }
     }
 
@@ -77,15 +79,31 @@ class DiskIndexer:
             self,
             index_file: str = "kernel32_index.pkl.gz",
             skip_dirs: Optional[Iterable[str]] = None,
+            drive: str = "C:",
             auto_build: bool = True,
     ):
         self.index_file = index_file
-        self.skip_dirs = set(d.lower() for d in (skip_dirs or self.DEFAULT_SKIP_DIRS_BY_DRIVE.get("C:")))
 
-        self.files: List[Dict[str, Any]] = []
-        self.file_map: Dict[str, Dict[str, Any]] = {}
-        self.meta: Dict[str, Any] = {}
-        self.ready: bool = False
+        drive = drive.upper()
+
+        base_skip = set(map(str.lower, self.COMMON_SKIP_DIRS))
+        drive_skip = set(
+            d.lower()
+            for d in self.SKIP_DIRS_BY_DRIVE.get(drive, [])
+        )
+        user_skip = set(
+            d.lower()
+            for d in (skip_dirs or [])
+        )
+
+        # 合并规则（优先级：用户 > 驱动器 > 全局）
+        self.skip_dirs: Set[str] = base_skip | drive_skip | user_skip
+
+        self.files = []
+        self.file_map = {}
+        self.meta = {}
+        self.ready = False
+
         self._init_index(auto_build)
 
     def _init_index(self, auto_build: bool):
@@ -248,6 +266,10 @@ class DiskIndexer:
     def _build_file_item(self, fd, name, full_path) -> Dict[str, Any]:
         size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
         ext = os.path.splitext(name)[1].lower()
+        ts = (
+                fd.ftLastWriteTime.dwHighDateTime << 32
+                | fd.ftLastWriteTime.dwLowDateTime
+        )
 
         return {
             "Name": name,
@@ -256,6 +278,7 @@ class DiskIndexer:
             "Path": full_path,
             "RawSize": size,
             "UpdateTime": filetime_to_str(fd.ftLastWriteTime),
+            "UpdateTS": ts,
             "FP": self._fingerprint(fd),
         }
 
@@ -277,14 +300,14 @@ class DiskIndexer:
     # =========================
     # 搜索
     # =========================
-    def search(self, query: SearchRequest):
-        keyword = (query.keyword or "").strip().lower()
+    def search(self, keyword: str, file_type: str):
+        keyword = keyword.strip().lower()
         if not keyword:
             return []
 
         exts = None
-        if query.file_type in FILE_TYPE_MAP:
-            exts = set(FILE_TYPE_MAP[query.file_type])
+        if file_type in FILE_TYPE_MAP:
+            exts = set(FILE_TYPE_MAP[file_type])
 
         results = []
         append = results.append
@@ -295,6 +318,65 @@ class DiskIndexer:
             if exts and f["Ext"] not in exts:
                 continue
             append(f)
+
+        return results
+
+    def search_advanced(
+            self,
+            keywords: str,
+            file_type: Optional[str] = None,
+            sort_by: str = "time",  # time | size | name
+            reverse: bool = True,
+            min_size: Optional[int] = None,
+            max_size: Optional[int] = None,
+            match_mode: str = "or",
+    ):
+        if not keywords:
+            return []
+
+        # 多关键词 AND
+        kws = [k.lower() for k in keywords.split() if k.strip()]
+        if not kws:
+            return []
+
+        # 文件类型过滤
+        exts = None
+        if file_type in FILE_TYPE_MAP:
+            exts = set(FILE_TYPE_MAP[file_type])
+
+        results = []
+        append = results.append
+
+        for f in self.files:
+            # 类型过滤
+            if exts and f["Ext"] not in exts:
+                continue
+
+            # 大小过滤
+            size = f.get("RawSize", 0)
+            if min_size is not None and size < min_size:
+                continue
+            if max_size is not None and size > max_size:
+                continue
+
+            # 关键词匹配（文件名 + 路径）
+            haystack = f'{f["NameLC"]} {f["Path"].lower()}'
+            if match_mode == "and":
+                if not all(k in haystack for k in kws):
+                    continue
+            else:  # or
+                if not any(k in haystack for k in kws):
+                    continue
+
+            append(f)
+
+        # 排序
+        if sort_by == "size":
+            results.sort(key=lambda x: x.get("RawSize", 0), reverse=reverse)
+        elif sort_by == "name":
+            results.sort(key=lambda x: x.get("NameLC", ""), reverse=reverse)
+        else:  # time
+            results.sort(key=lambda x: x.get("UpdateTS", 0), reverse=reverse)
 
         return results
 
@@ -364,9 +446,19 @@ if __name__ == '__main__':
     # indexer.update_index()
 
     # 搜索
-    searchQuery = SearchRequest()
-    searchQuery.keyword = 'docker'
-    searchQuery.file_type = '文档'
-    results = indexer.search(searchQuery)
+    results = indexer.search('docker', '文档')
+    sort_result = indexer.search_advanced(
+        keywords="docker 仙逆",
+        file_type="文档",
+        sort_by="size",
+        reverse=True,
+        min_size=100 * 1024,  # ≥10KB
+    )
+
     for result in results:
         print(result)
+
+    print("=" * 20)
+
+    for result1 in sort_result:
+        print(result1)
