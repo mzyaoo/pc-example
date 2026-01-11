@@ -17,7 +17,7 @@ def search(query: str, file_type: str = None):
     searchQuery = SearchRequest()
     searchQuery.keyword = query
     searchQuery.file_type = file_type
-    results = indexer.search(searchQuery)
+    results = indexer.search(query,file_type)
     return results
 
 

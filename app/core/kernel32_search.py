@@ -6,7 +6,7 @@ import gzip
 import sys
 
 from ctypes import wintypes
-from typing import Dict, List, Optional, Any, Iterable, Tuple, Set
+from typing import Optional
 
 from app.core.windows_utils import get_available_drives, filetime_to_str, format_size
 
@@ -50,53 +50,45 @@ FILE_TYPE_MAP = {
     "视频": [".mp4", ".avi", ".mkv", ".mov", ".wmv"],
     "音频": [".mp3", ".wav", ".flac", ".aac"],
     "文件夹": None,
-    "其他": 'others',
+    "其他": "others",
 }
 
 
 # =========================
-# DiskIndexer（工程版）
+# DiskIndexer
 # =========================
 class DiskIndexer:
-    INDEX_VERSION = 1
-
     COMMON_SKIP_DIRS = {
-        "$recycle.bin",
+        "windows",
+        "system32",
+        "syswow64",
+        "winsxs",
         "system volume information",
-    }
-
-    SKIP_DIRS_BY_DRIVE = {
-        "C:": {
-            "windows",
-            "program files",
-            "program files (x86)",
-            "programdata",
-        }
+        "$recycle.bin",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "appdata",
+        "local settings",
+        "temp",
+        "tmp",
+        "$windows.~bt",
+        "$windows.~ws",
+        "$getcurrent",
     }
 
     def __init__(
             self,
-            index_file: str = "kernel32_index.pkl.gz",
-            skip_dirs: Optional[Iterable[str]] = None,
-            drive: str = "C:",
-            auto_build: bool = True,
+            index_file="kernel32_index.pkl.gz",
+            skip_dirs=None,
+            auto_build=True,
     ):
         self.index_file = index_file
 
-        drive = drive.upper()
-
         base_skip = set(map(str.lower, self.COMMON_SKIP_DIRS))
-        drive_skip = set(
-            d.lower()
-            for d in self.SKIP_DIRS_BY_DRIVE.get(drive, [])
-        )
-        user_skip = set(
-            d.lower()
-            for d in (skip_dirs or [])
-        )
+        user_skip = set(d.lower() for d in (skip_dirs or []))
 
-        # 合并规则（优先级：用户 > 驱动器 > 全局）
-        self.skip_dirs: Set[str] = base_skip | drive_skip | user_skip
+        self.skip_dirs = base_skip | user_skip
 
         self.files = []
         self.file_map = {}
@@ -105,35 +97,29 @@ class DiskIndexer:
 
         self._init_index(auto_build)
 
-    def _init_index(self, auto_build: bool):
+    # =========================
+    # Index init
+    # =========================
+    def _init_index(self, auto_build):
         if os.path.exists(self.index_file):
             if self._try_load_index():
                 self.ready = True
                 return
             else:
-                print("索引损坏或不兼容，准备重建…")
-                try:
-                    os.remove(self.index_file)
-                except OSError:
-                    pass
+                os.remove(self.index_file)
 
         if auto_build:
-            print("索引不存在，首次启动自动建立索引…")
             self.build_index(force=True)
             self.ready = True
-        else:
-            self.ready = False
 
-    def build_index(self, drives: Optional[List[str]] = None, force: bool = False):
+    # =========================
+    # Build / Update
+    # =========================
+    def build_index(self, drives=None, force=False):
         if not force and self._try_load_index():
-            print("已加载现有索引（无需重建）")
             return
 
-        if drives is None:
-            drives = get_available_drives()
-
-        print(f"开始建立索引: {', '.join(drives)}")
-        start = time.time()
+        drives = drives or get_available_drives()
 
         self.files.clear()
         self.file_map.clear()
@@ -144,49 +130,30 @@ class DiskIndexer:
         self._build_meta(drives)
         self._save_index()
 
-        print(f"索引完成，耗时 {time.time() - start:.2f}s，文件数 {len(self.files)}")
-
-    def update_index(self, drives: Optional[List[str]] = None):
-        """增量更新索引（推荐日常使用）"""
+    def update_index(self, drives=None):
         if not self._try_load_index():
-            self.build_index(drives=drives, force=True)
+            self.build_index(drives, force=True)
             return
 
-        if drives is None:
-            drives = self.meta.get("drives") or get_available_drives()
-
-        print("开始增量更新索引...")
-        start = time.time()
+        drives = drives or self.meta["drives"]
 
         for d in drives:
             self._scan_drive_incremental(d)
 
         self.meta["updated_at"] = time.time()
         self.meta["total_files"] = len(self.files)
-
         self._save_index()
 
-        print(f"增量更新完成，耗时 {time.time() - start:.2f}s")
-
-    def rebuild_index(self, drives: Optional[List[str]] = None):
-        print("强制重建索引...")
-        if os.path.exists(self.index_file):
-            os.remove(self.index_file)
-        self.build_index(drives=drives, force=True)
-
     # =========================
-    # 扫描逻辑
+    # Scan logic
     # =========================
-    def _scan_drive_full(self, root: str):
+    def _scan_drive_full(self, root):
         stack = [root]
 
         while stack:
             path = stack.pop()
-            search_path = os.path.join(path, "*")
-
-            fd = WIN32_FIND_DATAW()
-            h = kernel32.FindFirstFileW(search_path, ctypes.byref(fd))
-            if h == INVALID_HANDLE_VALUE:
+            h, fd = self._find_first(path)
+            if not h:
                 continue
 
             try:
@@ -196,33 +163,29 @@ class DiskIndexer:
                         full = os.path.join(path, name)
                         is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY
 
-                        if is_dir:
-                            if name.lower() not in self.skip_dirs:
-                                item = self._build_item(fd, name, full, is_dir=True)
-                                self.files.append(item)
-                                self.file_map[full] = item
-                                stack.append(full)
+                        if is_dir and name.lower() in self.skip_dirs:
+                            pass
                         else:
-                            item = self._build_item(fd, name, full, is_dir=False)
+                            item = self._build_item(fd, name, full, bool(is_dir))
                             self.files.append(item)
                             self.file_map[full] = item
 
+                        if is_dir and name.lower() not in self.skip_dirs:
+                            stack.append(full)
+
                     if not kernel32.FindNextFileW(h, ctypes.byref(fd)):
                         break
             finally:
                 kernel32.FindClose(h)
 
-    def _scan_drive_incremental(self, root: str):
+    def _scan_drive_incremental(self, root):
         stack = [root]
-        seen_paths = set()
+        seen = set()
 
         while stack:
             path = stack.pop()
-            search_path = os.path.join(path, "*")
-
-            fd = WIN32_FIND_DATAW()
-            h = kernel32.FindFirstFileW(search_path, ctypes.byref(fd))
-            if h == INVALID_HANDLE_VALUE:
+            h, fd = self._find_first(path)
+            if not h:
                 continue
 
             try:
@@ -231,101 +194,64 @@ class DiskIndexer:
                     if name not in (".", ".."):
                         full = os.path.join(path, name)
                         is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY
+                        seen.add(full)
 
-                        if is_dir:
-                            if name.lower() not in self.skip_dirs:
-                                stack.append(full)
+                        old = self.file_map.get(full)
+                        if not old:
+                            item = self._build_item(fd, name, full, bool(is_dir))
+                            self.files.append(item)
+                            self.file_map[full] = item
                         else:
-                            seen_paths.add(full)
-                            fp = self._fingerprint(fd)
+                            if old["FP"] != self._fingerprint(fd):
+                                self._update_item(old, fd)
 
-                            old = self.file_map.get(full)
-                            if not old:
-                                item = self._build_file_item(fd, name, full)
-                                self.files.append(item)
-                                self.file_map[full] = item
-                            elif old["FP"] != fp:
-                                self._update_file_item(old, fd)
+                        if is_dir and name.lower() not in self.skip_dirs:
+                            stack.append(full)
 
                     if not kernel32.FindNextFileW(h, ctypes.byref(fd)):
                         break
             finally:
                 kernel32.FindClose(h)
 
-        # 删除不存在的文件
-        to_remove = [
-            p for p in self.file_map
-            if p.startswith(root) and p not in seen_paths
-        ]
-
-        for p in to_remove:
-            item = self.file_map.pop(p)
-            self.files.remove(item)
+        for p in list(self.file_map):
+            if p.startswith(root) and p not in seen:
+                self.files.remove(self.file_map[p])
+                del self.file_map[p]
 
     # =========================
-    # 文件构建 / 更新
+    # Helpers
     # =========================
-    def _build_file_item(self, fd, name, full_path) -> Dict[str, Any]:
-        size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
-        ext = os.path.splitext(name)[1].lower()
-        ts = (
-                fd.ftLastWriteTime.dwHighDateTime << 32
-                | fd.ftLastWriteTime.dwLowDateTime
-        )
+    def _find_first(self, path):
+        fd = WIN32_FIND_DATAW()
+        h = kernel32.FindFirstFileW(os.path.join(path, "*"), ctypes.byref(fd))
+        if h == INVALID_HANDLE_VALUE:
+            return None, None
+        return h, fd
+
+    def _build_item(self, fd, name, full, is_dir):
+        ts = (fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime
+        size = 0 if is_dir else (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
+        ext = "" if is_dir else os.path.splitext(name)[1].lower()
 
         return {
+            "Type": "DIR" if is_dir else "FILE",
             "Name": name,
             "NameLC": name.lower(),
             "Ext": ext,
-            "Path": full_path,
+            "Path": full,
             "RawSize": size,
             "UpdateTime": filetime_to_str(fd.ftLastWriteTime),
             "UpdateTS": ts,
             "FP": self._fingerprint(fd),
         }
 
-    def _build_item(self, fd, name, full_path, is_dir: bool):
-        ts = (
-                fd.ftLastWriteTime.dwHighDateTime << 32
-                | fd.ftLastWriteTime.dwLowDateTime
-        )
-
-        if is_dir:
-            return {
-                "Type": "DIR",
-                "Name": name,
-                "NameLC": name.lower(),
-                "Ext": "",
-                "Path": full_path,
-                "RawSize": 0,
-                "UpdateTime": filetime_to_str(fd.ftLastWriteTime),
-                "UpdateTS": ts,
-                "FP": self._fingerprint(fd),
-            }
-
-        size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
-        ext = os.path.splitext(name)[1].lower()
-
-        return {
-            "Type": "FILE",
-            "Name": name,
-            "NameLC": name.lower(),
-            "Ext": ext,
-            "Path": full_path,
-            "RawSize": size,
-            "UpdateTime": filetime_to_str(fd.ftLastWriteTime),
-            "UpdateTS": ts,
-            "FP": self._fingerprint(fd),
-        }
-
-    def _update_file_item(self, item: Dict[str, Any], fd):
-        size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
-        item["RawSize"] = size
+    def _update_item(self, item, fd):
+        item["RawSize"] = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
         item["UpdateTime"] = filetime_to_str(fd.ftLastWriteTime)
         item["FP"] = self._fingerprint(fd)
 
     @staticmethod
-    def _fingerprint(fd) -> Tuple[int, int, int, int]:
+    def _fingerprint(fd):
         return (
             fd.nFileSizeHigh,
             fd.nFileSizeLow,
@@ -334,48 +260,92 @@ class DiskIndexer:
         )
 
     # =========================
-    # 搜索
+    # Search
     # =========================
-    def search(self, keyword: str, file_type: str):
-        keyword = keyword.strip().lower()
-        if not keyword:
+    def search(
+            self,
+            keywords: str,
+            file_type: str,
+            keyword_mode: str = "or",
+            min_size: Optional[int] = None,
+            max_size: Optional[int] = None,
+            min_time: Optional[int] = None,
+            max_time: Optional[int] = None,
+            sort_by: str = "time",
+            reverse: bool = True,
+    ):
+        if not keywords:
+            return []
+
+        # ---------- 关键词处理 ----------
+        kws = [k.lower() for k in keywords.split() if k.strip()]
+        if not kws:
             return []
 
         results = []
         append = results.append
 
+        # ---------- 文件类型准备 ----------
+        exts = FILE_TYPE_MAP.get(file_type)
+
         for f in self.files:
-            if keyword not in f["NameLC"]:
-                continue
-
-            # 文件夹搜索
+            # ---------- 文件大类过滤 ----------
             if file_type == "文件夹":
-                if f["Type"] == "DIR":
-                    append(f)
+                if f["Type"] != "DIR":
+                    continue
+            else:
+                if f["Type"] != "FILE":
+                    continue
+
+                if file_type == "其他":
+                    if self._is_known_ext(f["Ext"]):
+                        continue
+                elif isinstance(exts, list):
+                    if f["Ext"] not in exts:
+                        continue
+            if file_type == "文件夹":
+                haystack = f'{f["NameLC"]} {f["Path"].lower()}'
+            else:
+                haystack = f'{f["NameLC"].lower()}'
+
+            if keyword_mode == "and":
+                if not all(k in haystack for k in kws):
+                    continue
+            else:  # or
+                if not any(k in haystack for k in kws):
+                    continue
+
+            # ---------- 文件大小过滤 ----------
+            size = f.get("RawSize", 0)
+            if min_size is not None and size < min_size:
+                continue
+            if max_size is not None and size > max_size:
                 continue
 
-            # 文件搜索
-            if f["Type"] != "FILE":
+            # ---------- 时间过滤 ----------
+            ts = f.get("UpdateTS", 0)
+            if min_time is not None and ts < min_time:
+                continue
+            if max_time is not None and ts > max_time:
                 continue
 
-            # 其他类型
-            if file_type == "其他":
-                if not self._is_known_ext(f["Ext"]):
-                    append(f)
-                continue
+            append(f)
 
-            exts = FILE_TYPE_MAP.get(file_type)
-            if exts and f["Ext"] in exts:
-                append(f)
+        # ---------- 排序 ----------
+        if sort_by == "size":
+            results.sort(key=lambda x: x.get("RawSize", 0), reverse=reverse)
+        elif sort_by == "name":
+            results.sort(key=lambda x: x.get("NameLC", ""), reverse=reverse)
+        else:  # time
+            results.sort(key=lambda x: x.get("UpdateTS", 0), reverse=reverse)
 
         return results
 
     # =========================
-    # 索引存储
+    # Index storage
     # =========================
     def _build_meta(self, drives):
         self.meta = {
-            "version": self.INDEX_VERSION,
             "created_at": time.time(),
             "updated_at": time.time(),
             "python": sys.version,
@@ -385,71 +355,40 @@ class DiskIndexer:
         }
 
     def _save_index(self):
-        data = {
-            "meta": self.meta,
-            "files": self.files,
-        }
         with gzip.open(self.index_file, "wb") as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"索引已保存: {self.index_file}")
+            pickle.dump({"meta": self.meta, "files": self.files}, f)
 
-    def _try_load_index(self) -> bool:
-        if not os.path.exists(self.index_file):
-            return False
-
+    def _try_load_index(self):
         try:
             with gzip.open(self.index_file, "rb") as f:
                 data = pickle.load(f)
         except Exception:
             return False
 
-        meta = data.get("meta")
-        if not meta or meta.get("version") != self.INDEX_VERSION:
-            return False
-
-        if set(meta.get("skip_dirs", [])) != self.skip_dirs:
-            return False
-
-        self.meta = meta
-        self.files = data.get("files", [])
+        self.meta = data["meta"]
+        self.files = data["files"]
         self.file_map = {f["Path"]: f for f in self.files}
-
         return True
 
-    # =========================
-    # UI 显示辅助
-    # =========================
     @staticmethod
-    def enrich_for_display(item: Dict[str, Any]) -> Dict[str, Any]:
-        new_item = dict(item)
-        new_item["Size"] = format_size(item.get("RawSize", 0))
-        return new_item
-
-    @staticmethod
-    def _is_known_ext(ext: str) -> bool:
+    def _is_known_ext(ext):
         for v in FILE_TYPE_MAP.values():
             if isinstance(v, list) and ext in v:
                 return True
         return False
 
+    @staticmethod
+    def enrich_for_display(item):
+        item = dict(item)
+        item["Size"] = format_size(item.get("RawSize", 0))
+        return item
 
-if __name__ == '__main__':
+
+# =========================
+# Test
+# =========================
+if __name__ == "__main__":
     indexer = DiskIndexer()
-
-    # 第一次
-    # indexer.build_index()
-
-    # 以后启动
-    # indexer.update_index()
-
-    # 搜索
-    results = indexer.search('Tools', '文件夹')
-
-
-    for result in results:
-        print(result)
-
-    print("=" * 20)
-
-    # for result1 in sort_result:
-    #     print(result1)
+    results = indexer.search("Docker", "文档")
+    for r in results:
+        print(r)
