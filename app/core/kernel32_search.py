@@ -45,13 +45,12 @@ kernel32.FindClose.restype = wintypes.BOOL
 # 文件类型映射
 # =========================
 FILE_TYPE_MAP = {
-    "图片": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".ico", ".svg"],
     "文档": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt"],
+    "图片": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".ico", ".svg"],
     "视频": [".mp4", ".avi", ".mkv", ".mov", ".wmv"],
     "音频": [".mp3", ".wav", ".flac", ".aac"],
-    "压缩包": [".zip", ".rar", ".7z"],
-    "代码": [".py", ".js", ".html", ".css", ".json", ".xml"],
-    "可执行文件": [".exe", ".msi", ".bat"],
+    "文件夹": None,
+    "其他": 'others',
 }
 
 
@@ -199,9 +198,12 @@ class DiskIndexer:
 
                         if is_dir:
                             if name.lower() not in self.skip_dirs:
+                                item = self._build_item(fd, name, full, is_dir=True)
+                                self.files.append(item)
+                                self.file_map[full] = item
                                 stack.append(full)
                         else:
-                            item = self._build_file_item(fd, name, full)
+                            item = self._build_item(fd, name, full, is_dir=False)
                             self.files.append(item)
                             self.file_map[full] = item
 
@@ -282,6 +284,40 @@ class DiskIndexer:
             "FP": self._fingerprint(fd),
         }
 
+    def _build_item(self, fd, name, full_path, is_dir: bool):
+        ts = (
+                fd.ftLastWriteTime.dwHighDateTime << 32
+                | fd.ftLastWriteTime.dwLowDateTime
+        )
+
+        if is_dir:
+            return {
+                "Type": "DIR",
+                "Name": name,
+                "NameLC": name.lower(),
+                "Ext": "",
+                "Path": full_path,
+                "RawSize": 0,
+                "UpdateTime": filetime_to_str(fd.ftLastWriteTime),
+                "UpdateTS": ts,
+                "FP": self._fingerprint(fd),
+            }
+
+        size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
+        ext = os.path.splitext(name)[1].lower()
+
+        return {
+            "Type": "FILE",
+            "Name": name,
+            "NameLC": name.lower(),
+            "Ext": ext,
+            "Path": full_path,
+            "RawSize": size,
+            "UpdateTime": filetime_to_str(fd.ftLastWriteTime),
+            "UpdateTS": ts,
+            "FP": self._fingerprint(fd),
+        }
+
     def _update_file_item(self, item: Dict[str, Any], fd):
         size = (fd.nFileSizeHigh << 32) + fd.nFileSizeLow
         item["RawSize"] = size
@@ -305,78 +341,32 @@ class DiskIndexer:
         if not keyword:
             return []
 
-        exts = None
-        if file_type in FILE_TYPE_MAP:
-            exts = set(FILE_TYPE_MAP[file_type])
-
         results = []
         append = results.append
 
         for f in self.files:
             if keyword not in f["NameLC"]:
                 continue
-            if exts and f["Ext"] not in exts:
-                continue
-            append(f)
 
-        return results
-
-    def search_advanced(
-            self,
-            keywords: str,
-            file_type: Optional[str] = None,
-            sort_by: str = "time",  # time | size | name
-            reverse: bool = True,
-            min_size: Optional[int] = None,
-            max_size: Optional[int] = None,
-            match_mode: str = "or",
-    ):
-        if not keywords:
-            return []
-
-        # 多关键词 AND
-        kws = [k.lower() for k in keywords.split() if k.strip()]
-        if not kws:
-            return []
-
-        # 文件类型过滤
-        exts = None
-        if file_type in FILE_TYPE_MAP:
-            exts = set(FILE_TYPE_MAP[file_type])
-
-        results = []
-        append = results.append
-
-        for f in self.files:
-            # 类型过滤
-            if exts and f["Ext"] not in exts:
+            # 文件夹搜索
+            if file_type == "文件夹":
+                if f["Type"] == "DIR":
+                    append(f)
                 continue
 
-            # 大小过滤
-            size = f.get("RawSize", 0)
-            if min_size is not None and size < min_size:
-                continue
-            if max_size is not None and size > max_size:
+            # 文件搜索
+            if f["Type"] != "FILE":
                 continue
 
-            # 关键词匹配（文件名 + 路径）
-            haystack = f'{f["NameLC"]} {f["Path"].lower()}'
-            if match_mode == "and":
-                if not all(k in haystack for k in kws):
-                    continue
-            else:  # or
-                if not any(k in haystack for k in kws):
-                    continue
+            # 其他类型
+            if file_type == "其他":
+                if not self._is_known_ext(f["Ext"]):
+                    append(f)
+                continue
 
-            append(f)
-
-        # 排序
-        if sort_by == "size":
-            results.sort(key=lambda x: x.get("RawSize", 0), reverse=reverse)
-        elif sort_by == "name":
-            results.sort(key=lambda x: x.get("NameLC", ""), reverse=reverse)
-        else:  # time
-            results.sort(key=lambda x: x.get("UpdateTS", 0), reverse=reverse)
+            exts = FILE_TYPE_MAP.get(file_type)
+            if exts and f["Ext"] in exts:
+                append(f)
 
         return results
 
@@ -435,6 +425,13 @@ class DiskIndexer:
         new_item["Size"] = format_size(item.get("RawSize", 0))
         return new_item
 
+    @staticmethod
+    def _is_known_ext(ext: str) -> bool:
+        for v in FILE_TYPE_MAP.values():
+            if isinstance(v, list) and ext in v:
+                return True
+        return False
+
 
 if __name__ == '__main__':
     indexer = DiskIndexer()
@@ -446,19 +443,13 @@ if __name__ == '__main__':
     # indexer.update_index()
 
     # 搜索
-    results = indexer.search('docker', '文档')
-    sort_result = indexer.search_advanced(
-        keywords="docker 仙逆",
-        file_type="文档",
-        sort_by="size",
-        reverse=True,
-        min_size=100 * 1024,  # ≥10KB
-    )
+    results = indexer.search('Tools', '文件夹')
+
 
     for result in results:
         print(result)
 
     print("=" * 20)
 
-    for result1 in sort_result:
-        print(result1)
+    # for result1 in sort_result:
+    #     print(result1)
